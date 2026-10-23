@@ -4,6 +4,11 @@ TensorFold serves language models from a Zig binary on Apple Silicon and NVIDIA 
 The engine reads checkpoints, tokenizes requests and runs Metal or CUDA kernels directly.
 Serving needs no Python or MLX installation.
 
+> **This fork: Volta (sm_70) support.** Native CUDA kernels for Quadro
+> GV100-class GPUs — MLX 4-bit and NVFP4 checkpoints, validated on a GV100
+> (263-check suite, end-to-end with MTP and CUDA graph capture). [Feature
+> guide](docs/volta-sm70.md) · [Development story](docs/volta-sm70-story.md).
+
 Building with a coding agent? Have it load the [contributor skill](docs/recipes/SKILL.md) before it writes any code.
 
 ## Quick start
