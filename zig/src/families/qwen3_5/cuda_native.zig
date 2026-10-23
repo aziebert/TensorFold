@@ -13,6 +13,7 @@ const Draft = @import("cuda_draft.zig").Draft;
 const vision_prompt = @import("cuda_vision_prompt.zig");
 const reuse = @import("cuda_reuse.zig");
 const Mtp = @import("cuda_mtp.zig").Mtp;
+const mtpw = @import("cuda_mtp_weights.zig");
 const be = lanes.backend;
 pub const vision = @import("cuda_vision.zig");
 pub const slide = @import("cuda_slide.zig");
@@ -107,6 +108,15 @@ pub fn openDrafter(gpa: std.mem.Allocator, io: std.Io, p: *anyopaque, dir: []con
     if (bits != 4) return error.DrafterBitsUnsupported;
     const l: *Lanes = @ptrCast(@alignCast(p));
     if (l.caches.count() != 0 or l.pool.items.len != 0) return error.TapsAfterStreams;
+    if (mtpw.standaloneMtp(gpa, io, dir)) {
+        // the standalone MTP layer (Qwen3.8-27B's drafter), not a DFlash2 draft model: init as openMtp, kept in the dense path's prepare shape.
+        const d = try Mtp.init(gpa, io, l.e, dir, l.capacity);
+        errdefer d.deinit();
+        try l.e.setTaps(d.taps());
+        cost_adapter.identify(l, dir, .mtp);
+        try l.timeWindows(d, null);
+        return .{ .drafter = d.drafter(), .ctx = d, .close = closeMtp, .reserve = reserveMtp, .prepare = .{ .ctx = d, .run = mtpFacts, .bytes = 0 } };
+    }
     const d = try Draft.init(gpa, io, l.e, dir);
     errdefer d.deinit();
     try l.e.setTaps(d.taps());
@@ -137,6 +147,12 @@ fn reserveMtp(p: *anyopaque, streams: u32) anyerror!void {
 fn closeMtp(p: *anyopaque) void {
     const d: *Mtp = @ptrCast(@alignCast(p));
     d.deinit();
+}
+
+/// The MTP drafter's prepare (the dense openDrafter keeps the DFlash2 shape): its window costs were timed at init, so this just reports them.
+fn mtpFacts(p: *anyopaque) !lanes.drafter.Facts {
+    const d: *Mtp = @ptrCast(@alignCast(p));
+    return d.drafter().facts();
 }
 
 fn calibrateDrafter(p: *anyopaque) !lanes.drafter.Facts {

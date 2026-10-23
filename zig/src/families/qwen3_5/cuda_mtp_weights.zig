@@ -5,6 +5,7 @@ const core = @import("core");
 const engine = @import("cuda_engine.zig");
 const geometry = @import("cuda_geometry.zig");
 const weights = @import("cuda_weights.zig");
+const platform = @import("sys");
 
 const Affine4 = cuda.qlinear.Affine4;
 const Proj = engine.Proj;
@@ -86,4 +87,63 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8) !We
     w.o = try weights.linear(e, &w, &ck, &stage, p, "self_attn.o_proj", g.hidden, g.attnWidth(), 4);
     w.mlp = try weights.routed(e, &w, &ck, &stage, p, 4);
     return w;
+}
+
+/// The dense model's MTP layer (its own model.safetensors, bare keys, one dense SwiGLU block) onto the device.
+/// The checkpoint's directory is TF_MTP_DIR, else `dir` (the main model's).
+pub fn loadDense(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8) !Weights {
+    const g = e.g;
+    const mdir: []const u8 = if (platform.c.getenv("TF_MTP_DIR")) |env| std.mem.span(env) else dir;
+    var ck: core.Checkpoint = .{ .gpa = gpa, .io = io };
+    defer ck.close();
+    try ck.add(mdir, "model.safetensors");
+    var w: Weights = .{ .arena = try DeviceBuffer.alloc(e.d, totalDense(g)), .fc_e = undefined, .fc_h = undefined, .norm_e = 0, .norm_h = 0, .input_norm = 0, .post_norm = 0, .q_norm = 0, .k_norm = 0, .norm = 0, .q = undefined, .k = undefined, .v = undefined, .o = undefined, .mlp = undefined };
+    errdefer w.arena.free();
+    try w.arena.fill8(0, null);
+    var stage = try DeviceBuffer.alloc(e.d, stageBytesDense(g));
+    defer stage.free();
+    const m = ""; // this checkpoint's keys are bare: no language_model.mtp. prefix
+    const p = "layers.0.";
+    w.fc_e = try weights.linearSlice(e, &w, &ck, &stage, m, "fc", g.hidden, 2 * g.hidden, 0, g.hidden);
+    w.fc_h = try weights.linearSlice(e, &w, &ck, &stage, m, "fc", g.hidden, 2 * g.hidden, g.hidden, g.hidden);
+    w.norm_e = try weights.tensor(&w, &ck, "{s}pre_fc_norm_embedding.weight", .{m}, .bf16, &.{g.hidden});
+    w.norm_h = try weights.tensor(&w, &ck, "{s}pre_fc_norm_hidden.weight", .{m}, .bf16, &.{g.hidden});
+    w.norm = try weights.tensor(&w, &ck, "{s}norm.weight", .{m}, .bf16, &.{g.hidden});
+    w.input_norm = try weights.tensor(&w, &ck, "{s}input_layernorm.weight", .{p}, .bf16, &.{g.hidden});
+    w.post_norm = try weights.tensor(&w, &ck, "{s}post_attention_layernorm.weight", .{p}, .bf16, &.{g.hidden});
+    w.q_norm = try weights.tensor(&w, &ck, "{s}self_attn.q_norm.weight", .{p}, .bf16, &.{head_dim});
+    w.k_norm = try weights.tensor(&w, &ck, "{s}self_attn.k_norm.weight", .{p}, .bf16, &.{head_dim});
+    w.q = try weights.linear(e, &w, &ck, &stage, p, "self_attn.q_proj", 2 * g.attnWidth(), g.hidden, 4);
+    w.k = try weights.linear(e, &w, &ck, &stage, p, "self_attn.k_proj", g.kv_heads * head_dim, g.hidden, 4);
+    w.v = try weights.linear(e, &w, &ck, &stage, p, "self_attn.v_proj", g.kv_heads * head_dim, g.hidden, 4);
+    w.o = try weights.linear(e, &w, &ck, &stage, p, "self_attn.o_proj", g.hidden, g.attnWidth(), 4);
+    w.mlp = .{ .dense = .{
+        .gate = try weights.linear(e, &w, &ck, &stage, p, "mlp.gate_proj", g.intermediate, g.hidden, 4),
+        .up = try weights.linear(e, &w, &ck, &stage, p, "mlp.up_proj", g.intermediate, g.hidden, 4),
+        .down = try weights.linear(e, &w, &ck, &stage, p, "mlp.down_proj", g.hidden, g.intermediate, 4),
+    } };
+    return w;
+}
+
+/// Device bytes of everything `loadDense` packs (one dense SwiGLU block instead of the routed experts).
+pub fn totalDense(g: geometry.Geometry) usize {
+    var t = 2 * weights.packedBytes(g.hidden, g.hidden, 4) + 7 * aligned(@max(g.hidden, head_dim) * 2);
+    t += weights.packedBytes(2 * g.attnWidth(), g.hidden, 4) + 2 * weights.packedBytes(g.kv_heads * head_dim, g.hidden, 4) + weights.packedBytes(g.hidden, g.attnWidth(), 4);
+    t += weights.packedBytes(g.intermediate, g.hidden, 4) + weights.packedBytes(g.intermediate, g.hidden, 4) + weights.packedBytes(g.hidden, g.intermediate, 4); // gate, up, down
+    return t;
+}
+
+/// The largest tensor `loadDense` stages, as stored: fc's whole rows, an attention or MLP projection.
+fn stageBytesDense(g: geometry.Geometry) usize {
+    const raw = weights.rawBytes;
+    return @max(@max(raw(g.hidden, 2 * g.hidden, 4), raw(2 * g.attnWidth(), g.hidden, 4)), @max(raw(g.intermediate, g.hidden, 4), raw(g.hidden, g.intermediate, 4)));
+}
+
+/// True when `dir/model.safetensors` is the standalone MTP layer (a top-level fc) rather than a DFlash2 draft model.
+pub fn standaloneMtp(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
+    const path = std.fs.path.join(gpa, &.{ dir, "model.safetensors" }) catch return false;
+    defer gpa.free(path);
+    var f = core.safetensors.File.open(gpa, io, path) catch return false;
+    defer f.close(io);
+    return f.get("fc.weight") != null;
 }

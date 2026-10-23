@@ -571,6 +571,11 @@ pub const Engine = struct {
             e.features = if (images) |im| im.features else 0;
             defer e.features = 0;
             try e.body(shape);
+        } else if (std.c.getenv("TF_Q35_NO_GRAPHS") != null) {
+            // the eager side of the graphs-versus-eager checks: the same launches, every step
+            e.features = if (images) |im| im.features else 0;
+            defer e.features = 0;
+            try e.body(shape);
         } else {
             const gop = try e.graphs.getOrPut(e.gpa, shape.key());
             if (!gop.found_existing) {

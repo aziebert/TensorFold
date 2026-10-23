@@ -207,6 +207,11 @@ pub fn linearSlice(e: *Engine, into: anytype, ck: *core.Checkpoint, stage: *Devi
         for (0..n) |r| @memcpy(part.*[r * cols * p[3] ..][0 .. cols * p[3]], t.bytes[(r * p[2] + from / per) * p[3] ..][0 .. cols * p[3]]);
     }
     defer for (parts) |p| e.gpa.free(p);
+    if (e.vqmm != null) {
+        // tf_vqmm884 reads the stored MLX layout straight off device; the sliced parts are already row-major MLX, so upload them raw, never pack4.
+        const l = Affine4.layout(n, len);
+        return .{ .w = try upload(into, parts[0]), .s = try upload(into, parts[1]), .b = try upload(into, parts[2]), .n = n, .k = len, .npad = l.npad };
+    }
     const q = try pack4(e, into, try stageParts(stage, .{ parts[0], parts[1], parts[2] }), n, len);
     try e.stream.synchronize(); // the next projection's staging overwrites this one's
     return q;

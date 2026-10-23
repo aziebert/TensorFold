@@ -74,6 +74,9 @@ pub const Mtp = struct {
     vb: u64,
     att: u64,
     xs: u64, // f32 group sums for the projections
+    mgate: u64, // dense-MLP scratch, the drafter's own (never the target's gate/up/act): gate, up, act = rows x intermediate bf16
+    mup: u64,
+    mact: u64,
     logits: u64, // max_lanes rows
     words: u64, // u32 logprob words a lane row
     picks: u64, // u32 zeros: the logprob rows' pick (unused)
@@ -101,10 +104,9 @@ pub const Mtp = struct {
     const staged_len = anc_at + max_lanes * anc_stride * 4;
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *E, dir: []const u8, capacity: usize) !*Mtp {
-        if (!e.g.moe()) return error.NotRouted;
         const d = try gpa.create(Mtp);
         errdefer gpa.destroy(d);
-        d.* = .{ .gpa = gpa, .io = io, .e = e, .w = undefined, .mod = undefined, .dmod = undefined, .fns = undefined, .ring_fns = undefined, .scratch = undefined, .capacity = capacity, .depth = default_depth, .trees = platform.c.getenv("TF_MTP_TREES") != null, .tap = .{@intCast(e.g.layers - 1)}, .taps_in = 0, .hin = 0, .hn = 0, .emb = 0, .en = 0, .h = 0, .r = 0, .x = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .xs = 0, .logits = 0, .words = 0, .picks = 0, .lane_state = 0, .lane_k = 0, .lane_v = 0, .anc = 0, .ids = 0, .tok = 0, .staged = undefined };
+        d.* = .{ .gpa = gpa, .io = io, .e = e, .w = undefined, .mod = undefined, .dmod = undefined, .fns = undefined, .ring_fns = undefined, .scratch = undefined, .capacity = capacity, .depth = default_depth, .trees = platform.c.getenv("TF_MTP_TREES") != null, .tap = .{@intCast(e.g.layers - 1)}, .taps_in = 0, .hin = 0, .hn = 0, .emb = 0, .en = 0, .h = 0, .r = 0, .x = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .xs = 0, .mgate = 0, .mup = 0, .mact = 0, .logits = 0, .words = 0, .picks = 0, .lane_state = 0, .lane_k = 0, .lane_v = 0, .anc = 0, .ids = 0, .tok = 0, .staged = undefined };
         if (platform.c.getenv("TF_MTP_DRAFTS")) |v| d.depth = std.fmt.parseInt(u32, std.mem.span(v), 10) catch default_depth;
         d.depth = @min(@max(d.depth, 1), most_window - 1);
         d.mod = try cuda.Module.load(e.d, cuda.kernels.qwen36_mtp);
@@ -113,7 +115,7 @@ pub const Mtp = struct {
         errdefer d.dmod.unload();
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(d.fns, name) = try d.mod.function("tf_q36m_" ++ name);
         inline for (@typeInfo(Ring).@"struct".field_names) |name| @field(d.ring_fns, name) = try d.dmod.function("tf_q35d_" ++ name);
-        d.w = try weights.load(gpa, io, e, dir);
+        d.w = if (e.g.moe()) try weights.load(gpa, io, e, dir) else try weights.loadDense(gpa, io, e, dir);
         errdefer d.w.deinit();
         d.scratch = try DeviceBuffer.alloc(e.d, d.scratchBytes());
         errdefer d.scratch.free();
@@ -193,6 +195,7 @@ pub const Mtp = struct {
             .{ "vb", R * kw * 2 },            .{ "att", R * aw * 2 },         .{ "xs", R * (@max(g.hidden, aw) / 64) * 4 }, .{ "logits", L * g.vocab * 2 },
             .{ "words", L * lp_words * 4 },   .{ "picks", L * 4 },            .{ "lane_state", L * g.hidden * 2 },          .{ "lane_k", L * kw * 2 },
             .{ "lane_v", L * kw * 2 },        .{ "anc", L * anc_stride * 4 }, .{ "ids", R * 4 },                            .{ "tok", 64 },
+            .{ "mgate", R * g.intermediate * 2 }, .{ "mup", R * g.intermediate * 2 }, .{ "mact", R * g.intermediate * 2 },
         };
         var total: usize = 0;
         inline for (sizes) |s| {
@@ -287,7 +290,17 @@ pub const Mtp = struct {
         }
         try d.proj(w.o, d.att, d.r, rows);
         try d.norm(d.h, d.r, w.post_norm, d.x, rows);
-        try e.routedRows(w.mlp.moe.router, w.mlp.moe.experts, d.x, d.r, rows, rows > 16);
+        switch (w.mlp) {
+            .moe => |m| try e.routedRows(m.router, m.experts, d.x, d.r, rows, rows > 16),
+            .dense => |m| {
+                // the target's gate/up/act are owned by its stream; the drafter runs on its own, so it keeps its own SwiGLU scratch.
+                try d.proj(m.gate, d.x, d.mgate, rows);
+                try d.proj(m.up, d.x, d.mup, rows);
+                const n: c_longlong = @intCast(rows * g.intermediate);
+                try e.run(e.fns.mlp_act, .{ (rows * g.intermediate + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ d.mgate, d.mup, d.mact, n, @as(u64, 0), @as(c_int, @intCast(g.intermediate)) });
+                try d.proj(m.down, d.mact, d.r, rows);
+            },
+        }
         try d.norm(d.h, d.r, w.norm, d.x, rows);
         if (pass == .ring) try e.run(d.ring_fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kb, d.vb, d.ringK(ctx), d.ringV(ctx), @as(c_int, @intCast(kw)), p0, cap });
     }
