@@ -184,6 +184,19 @@ pub const Lane = struct {
     prep_fn: Function, // tf_vprep: bf16 rows -> fp16 rows + row scales (from volta_qmm)
     prep_mod: Module, // the volta_qmm module that owns prep_fn
 
+    // Persistent decode scratch: grown eagerly once (the warmup runs before capture) for
+    // max_decode_rows and then reused, so a captured graph's baked-in pointers stay valid and no
+    // cuMemAlloc lands inside the capture window. A call with rows > max_decode_rows (an eager
+    // prefill) falls back to per-call allocation, which is legal there. sc_part/sc_cnt are shared
+    // with the bf16 path (same size formula for a given m, n, sk).
+    max_decode_rows: u32 = 0,
+    sc_alpha: memory_.DeviceBuffer, // per-column factor [n]
+    sc_x16: memory_.DeviceBuffer, // fp16 rows [m, k]
+    sc_xt: memory_.DeviceBuffer, // tiled rows
+    sc_rs: memory_.DeviceBuffer, // per-row scale [m]
+    sc_part: memory_.DeviceBuffer, // split-K partials
+    sc_cnt: memory_.DeviceBuffer, // split-K counters
+
     const COLS: u32 = 128; // n-columns a block covers
     const THREADS: u32 = 128; // threads a block
     const TARGET: u32 = 640; // blocks split_k884 fills
@@ -195,12 +208,41 @@ pub const Lane = struct {
         var prep_mod = try Module.load(d, kernels.volta_qmm);
         errdefer prep_mod.unload();
         const prep_fn = try prep_mod.function("tf_vprep");
-        return .{ .d = d, .q = q, .prep_fn = prep_fn, .prep_mod = prep_mod };
+        return .{
+            .d = d,
+            .q = q,
+            .prep_fn = prep_fn,
+            .prep_mod = prep_mod,
+            .sc_alpha = emptyBuf(d),
+            .sc_x16 = emptyBuf(d),
+            .sc_xt = emptyBuf(d),
+            .sc_rs = emptyBuf(d),
+            .sc_part = emptyBuf(d),
+            .sc_cnt = emptyBuf(d),
+        };
+    }
+
+    fn emptyBuf(d: *const Driver) memory_.DeviceBuffer {
+        return .{ .d = d, .ptr = 0, .len = 0 };
     }
 
     pub fn unload(self: *Lane) void {
+        self.sc_alpha.free();
+        self.sc_x16.free();
+        self.sc_xt.free();
+        self.sc_rs.free();
+        self.sc_part.free();
+        self.sc_cnt.free();
         self.q.unload();
         self.prep_mod.unload();
+    }
+
+    /// Grow `b` to at least `need` bytes, reusing it when it already fits. Reached only while not
+    /// capturing (the warmup runs eagerly before capture), so cuMemAlloc is legal here.
+    pub fn ensure(l: *Lane, b: *memory_.DeviceBuffer, need: usize) Error!void {
+        if (b.len >= need) return;
+        if (b.len > 0) b.free();
+        b.* = try memory_.DeviceBuffer.alloc(l.d, need);
     }
 
     /// What one call launches, from the shapes alone.

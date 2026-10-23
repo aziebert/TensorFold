@@ -96,7 +96,7 @@ pub const Rows = struct { x: u64, ldx: usize = 0, sums: u64 = 0, part: u64 = 0 }
 pub const Linear = struct {
     affine4: ?*const Affine4Kernels = null,
     lane: ?*const qmmf.Lane = null, // decode rows of every lane format; fp8g and bf16 prompt rows too
-    volta_lane: ?*const volta.Lane = null, // Volta (sm_70) decode: FP4 rows via the volta_qmm prep + tensor-core GEMM
+    volta_lane: ?*volta.Lane = null, // Volta (sm_70) decode: FP4 rows via the volta_qmm prep + tensor-core GEMM
     nvfp4_prompt: ?*const nvfp4.Prompt = null, // the prompt GEMM: nvfp4 and fp8 prompt rows (linear.py's prefill)
     ck: ?*const ck.Ck = null, // the checkpoint's own math: an fp8 weight with an input scale takes e4m3 rows
     ck_rows: u64 = 0, // its e4m3 rows (at least rows * k bytes), and slice partials where no cluster meets them
@@ -233,7 +233,7 @@ pub const Linear = struct {
 
     /// Volta rows: the bf16 input through the prep (bf16 -> fp16 + row scales), the tile, and the
     /// tensor-core GEMM; the weight's tensor scale broadcast is the per-column alpha.
-    fn onVoltaLane(v: *const volta.Lane, s: Stream, q: qmmf.Weight, in: Rows, out: u64, kind: qmmf.Out, rows: usize) !void {
+    fn onVoltaLane(v: *volta.Lane, s: Stream, q: qmmf.Weight, in: Rows, out: u64, kind: qmmf.Out, rows: usize) !void {
         const d = v.d;
         const m: u32 = @intCast(rows);
         const n = q.n;
@@ -241,30 +241,51 @@ pub const Linear = struct {
         const out_f32 = kind == .f32;
         // Determine the format: 0=fp4, 1=fp8, 2=mxfp8
         const fmt: u32 = if (q.mode == .fp4) 0 else if (q.mode == .fp8) 1 else 2;
-        var alpha = try memory.DeviceBuffer.alloc(d, @as(usize, n) * 4);
-        errdefer alpha.free();
         // The fp4 e2m1 decode (fp4x8 in qmmf_volta.cu) yields value * 2^-14 so the scaled
         // input keeps the fp16 mma product in range; that shift is never undone in the epilogue.
         // Compensate it in the per-column alpha for fp4 only (fp8/mxfp8 decode true codes).
         const alpha_f32: f32 = if (fmt == 0) q.scale * 16384.0 else q.scale;
-        try d.check(d.api.cuMemsetD32_v2(alpha.ptr, @bitCast(alpha_f32), @as(usize, n)), "cuMemsetD32");
         const ldx: u32 = if (in.ldx == 0) q.k else @intCast(in.ldx);
-        // Allocate the intermediate buffers
+        // Sizes of the intermediate buffers
         const xbytes: u64 = @as(u64, m) * @as(u64, k) * 2; // fp16 [m, k]
         const xtbytes: u64 = ((@as(u64, m) + 7) / 8) * @as(u64, k) * 16; // tiled: rowtiles*K int4 (16 B each)
+        const p = volta.Lane.plan(n, k, m);
+        const part_bytes: usize = if (p.sk > 1) @intCast(volta.Lane.partBytes(m, n, p.sk)) else 0;
+        const cnt_bytes: usize = if (p.sk > 1) @intCast(volta.Lane.cntBytes(m, n, p)) else 0;
+
+        // Decode (rows within the captured window): reuse the persistent scratch grown by the warmup,
+        // so a captured graph bakes in stable pointers and no cuMemAlloc lands inside the capture window.
+        if (v.max_decode_rows > 0 and m <= v.max_decode_rows) {
+            try v.ensure(&v.sc_alpha, @as(usize, n) * 4);
+            try d.check(d.api.cuMemsetD32_v2(v.sc_alpha.ptr, @bitCast(alpha_f32), @as(usize, n)), "cuMemsetD32");
+            try v.ensure(&v.sc_x16, @intCast(xbytes));
+            try v.ensure(&v.sc_xt, @intCast(xtbytes));
+            try v.ensure(&v.sc_rs, @as(usize, m) * 4);
+            if (p.sk > 1) {
+                try v.ensure(&v.sc_part, part_bytes);
+                try v.ensure(&v.sc_cnt, cnt_bytes);
+                try v.sc_cnt.fill32(0, s.handle);
+            }
+            try v.prep(s, in.x, ldx, m, k, v.sc_x16.ptr, v.sc_rs.ptr);
+            try v.tileX(s, v.sc_x16.ptr, v.sc_xt.ptr, m, k);
+            return v.matmul(s, v.sc_xt.ptr, v.sc_rs.ptr, q.codes, q.scales, v.sc_alpha.ptr, out, if (p.sk > 1) v.sc_part.ptr else 0, if (p.sk > 1) v.sc_cnt.ptr else 0, m, n, k, fmt, out_f32);
+        }
+
+        // Large eager-m (a prompt prefill): per-call scratch, freed on return. cuMemAlloc is legal here.
+        var alpha = try memory.DeviceBuffer.alloc(d, @as(usize, n) * 4);
+        errdefer alpha.free();
+        try d.check(d.api.cuMemsetD32_v2(alpha.ptr, @bitCast(alpha_f32), @as(usize, n)), "cuMemsetD32");
         var x16 = try memory.DeviceBuffer.alloc(d, @intCast(xbytes));
         errdefer x16.free();
         var xt = try memory.DeviceBuffer.alloc(d, @intCast(xtbytes));
         errdefer xt.free();
-        var rs = try memory.DeviceBuffer.alloc(d, @as(usize, m) * 4); // float [m]
+        var rs = try memory.DeviceBuffer.alloc(d, @as(usize, m) * 4);
         errdefer rs.free();
-        const p = volta.Lane.plan(n, k, m);
-        var part = try memory.DeviceBuffer.alloc(d, if (p.sk > 1) @intCast(volta.Lane.partBytes(m, n, p.sk)) else 0);
+        var part = try memory.DeviceBuffer.alloc(d, part_bytes);
         errdefer part.free();
-        var cnt = try memory.DeviceBuffer.alloc(d, if (p.sk > 1) @intCast(volta.Lane.cntBytes(m, n, p)) else 0);
+        var cnt = try memory.DeviceBuffer.alloc(d, cnt_bytes);
         errdefer cnt.free();
         if (p.sk > 1) try cnt.fill32(0, s.handle);
-        // Convert bf16 to fp16 + row scales, tile it, and run the GEMM
         try v.prep(s, in.x, ldx, m, k, x16.ptr, rs.ptr);
         try v.tileX(s, x16.ptr, xt.ptr, m, k);
         return v.matmul(s, xt.ptr, rs.ptr, q.codes, q.scales, alpha.ptr, out, if (p.sk > 1) part.ptr else 0, if (p.sk > 1) cnt.ptr else 0, m, n, k, fmt, out_f32);
@@ -273,7 +294,7 @@ pub const Linear = struct {
     /// Volta (sm_70) dense BF16 rows: raw bf16 input straight into the tensor-core GEMM (tf_vbf16_*);
     /// both operands convert to fp16 in-kernel and the single weight factor `scale` lands in the
     /// epilogue. `in.x` must be 16B-row-aligned (checked by the caller) and `ldx` a multiple of 8.
-    fn onVoltaBf16(v: *const volta.Lane, s: Stream, q: qmmf.Weight, in: Rows, out: u64, kind: qmmf.Out, rows: usize) !void {
+    fn onVoltaBf16(v: *volta.Lane, s: Stream, q: qmmf.Weight, in: Rows, out: u64, kind: qmmf.Out, rows: usize) !void {
         const d = v.d;
         const m: u32 = @intCast(rows);
         const n = q.n;
@@ -281,9 +302,21 @@ pub const Linear = struct {
         const out_f32 = kind == .f32;
         const ldx: u32 = if (in.ldx == 0) q.k else @intCast(in.ldx);
         const p = volta.Lane.plan(n, k, m);
-        var part = try memory.DeviceBuffer.alloc(d, if (p.sk > 1) @intCast(volta.Lane.partBytes(m, n, p.sk)) else 0);
+        const part_bytes: usize = if (p.sk > 1) @intCast(volta.Lane.partBytes(m, n, p.sk)) else 0;
+        const cnt_bytes: usize = if (p.sk > 1) @intCast(volta.Lane.cntBytes(m, n, p)) else 0;
+
+        // Decode (captured window): reuse the persistent split-K scratch.
+        if (v.max_decode_rows > 0 and m <= v.max_decode_rows and p.sk > 1) {
+            try v.ensure(&v.sc_part, part_bytes);
+            try v.ensure(&v.sc_cnt, cnt_bytes);
+            try v.sc_cnt.fill32(0, s.handle);
+            return v.matmulBf16(s, in.x, ldx, q.codes, q.scale, out, v.sc_part.ptr, v.sc_cnt.ptr, m, n, k, out_f32);
+        }
+
+        // Large eager-m (or sk == 1): per-call scratch (no allocation when sk == 1).
+        var part = try memory.DeviceBuffer.alloc(d, part_bytes);
         errdefer part.free();
-        var cnt = try memory.DeviceBuffer.alloc(d, if (p.sk > 1) @intCast(volta.Lane.cntBytes(m, n, p)) else 0);
+        var cnt = try memory.DeviceBuffer.alloc(d, cnt_bytes);
         errdefer cnt.free();
         if (p.sk > 1) try cnt.fill32(0, s.handle);
         return v.matmulBf16(s, in.x, ldx, q.codes, q.scale, out, if (p.sk > 1) part.ptr else 0, if (p.sk > 1) cnt.ptr else 0, m, n, k, out_f32);

@@ -233,6 +233,18 @@ pub const Engine = struct {
     fn capture(e: *Engine, windows: bool) !void {
         try e.reset();
         try e.stream.synchronize();
+        // Grow the persistent Volta matmul scratch eagerly (cuMemAlloc is legal before capture) for
+        // the whole captured row range, so the records below reuse it and bake in stable pointers
+        // instead of allocating inside the capture window. Skipped on non-Volta: its matmul takes
+        // caller-provided scratch, so there is nothing to pre-grow.
+        if (e.k.volta_lane) |*v| {
+            const maxw: u32 = if (windows) @intCast(state.windowRows(e.c)) else 1;
+            v.max_decode_rows = maxw;
+            try e.recordBody(.{ .window = .{ .rows = 1, .feed = true } }); // serial round
+            if (maxw > 1) try e.recordBody(.{ .window = .{ .rows = maxw, .feed = false } }); // largest verify window
+        }
+        try e.reset();
+        try e.stream.synchronize();
         e.serial = try e.record(.{ .window = .{ .rows = 1, .feed = true } });
         if (windows) try e.captureWindows();
     }

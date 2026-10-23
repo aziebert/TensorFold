@@ -270,7 +270,7 @@ pub const Ops = struct {
     /// Every projection format the kernels loaded (cuda/qlinear.zig).
     pub fn linear(o: Ops) cuda.qlinear.Linear {
         const m = if (o.k.modelopt) |*x| x else null;
-        return .{ .affine4 = &o.k.affine, .lane = if (m) |x| &x.lane else null, .nvfp4_prompt = if (m) |x| &x.gemm else null, .ck = if (o.k.ck) |*x| x else null, .ck_rows = o.ck8, .ggml = if (o.k.ggml) |*g| g else null, .volta_lane = if (o.k.volta_lane) |*v| v else null };
+        return .{ .affine4 = &o.k.affine, .lane = if (m) |x| &x.lane else null, .nvfp4_prompt = if (m) |x| &x.gemm else null, .ck = if (o.k.ck) |*x| x else null, .ck_rows = o.ck8, .ggml = if (o.k.ggml) |*g| g else null, .volta_lane = if (o.k.volta_lane) |*v| @constCast(v) else null };
     }
 
     /// Every grouped-expert format the kernels loaded (cuda/experts.zig).
