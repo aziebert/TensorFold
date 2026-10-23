@@ -68,36 +68,76 @@ __device__ __forceinline__ void mma(float (&d)[4], uint32_t a0, uint32_t a1, uin
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #else
-  // sm_70 fallback: software emulation of mma.m16n8k16 using FMA operations
-  // The mma instruction computes D[16x8] = A[16x16] * B[16x8] + C[16x8]
-  // Each thread holds a portion of A, B, and C/D in registers.
-  // This is a simplified emulation that may not be perfectly accurate but should be close enough.
-  
-  // Extract bf16 values from the registers
-  __nv_bfloat162 a0h = *reinterpret_cast<__nv_bfloat162*>(&a0);
-  __nv_bfloat162 a1h = *reinterpret_cast<__nv_bfloat162*>(&a1);
-  __nv_bfloat162 a2h = *reinterpret_cast<__nv_bfloat162*>(&a2);
-  __nv_bfloat162 a3h = *reinterpret_cast<__nv_bfloat162*>(&a3);
-  __nv_bfloat162 b0h = *reinterpret_cast<__nv_bfloat162*>(&b0);
-  __nv_bfloat162 b1h = *reinterpret_cast<__nv_bfloat162*>(&b1);
-  
-  // Convert to float
-  float a0_lo = __bfloat162float(a0h.x), a0_hi = __bfloat162float(a0h.y);
-  float a1_lo = __bfloat162float(a1h.x), a1_hi = __bfloat162float(a1h.y);
-  float a2_lo = __bfloat162float(a2h.x), a2_hi = __bfloat162float(a2h.y);
-  float a3_lo = __bfloat162float(a3h.x), a3_hi = __bfloat162float(a3h.y);
-  float b0_lo = __bfloat162float(b0h.x), b0_hi = __bfloat162float(b0h.y);
-  float b1_lo = __bfloat162float(b1h.x), b1_hi = __bfloat162float(b1h.y);
-  
-  // Simplified FMA: accumulate the products
-  // This is an approximation - the exact thread-to-element mapping is complex
-  d[0] = fmaf(a0_lo, b0_lo, d[0]);
-  d[1] = fmaf(a0_hi, b0_hi, d[1]);
-  d[2] = fmaf(a1_lo, b1_lo, d[2]);
-  d[3] = fmaf(a1_hi, b1_hi, d[3]);
-  
-  // Note: This is a simplified fallback that may not be perfectly accurate.
-  // For production use, a proper mma emulation should be implemented.
+  // sm_70 fallback: CORRECT software emulation of
+  // mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32.
+  // V100 has no bf16 tensor cores, so we gather the full A rows and B columns
+  // across the warp with __shfl_sync and accumulate exact fp32 dot products.
+  // Authoritative PTX layout (g = lane>>2, t = lane&3):
+  //   a0=(A[g][2t],A[g][2t+1])       a1=(A[g+8][2t],A[g+8][2t+1])
+  //   a2=(A[g][2t+8],A[g][2t+9])     a3=(A[g+8][2t+8],A[g+8][2t+9])
+  //   b0=(B[2t][g],B[2t+1][g])       b1=(B[2t+8][g],B[2t+9][g])   (B is K x N)
+  //   d0=D[g][2t] d1=D[g][2t+1] d2=D[g+8][2t] d3=D[g+8][2t+1]
+  //   D[i][n] = sum_k A[i][k]*B[k][n]
+  {
+    const unsigned FULL = 0xffffffffu;
+    const int lane = threadIdx.x & 31;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+
+    // Gather A rows g and g+8 (all 16 k-values each).
+    float ag[16], ag8[16];
+    #pragma unroll
+    for (int tt = 0; tt < 4; ++tt) {
+      const int src = g * 4 + tt;
+      uint32_t r0 = __shfl_sync(FULL, a0, src);
+      uint32_t r2 = __shfl_sync(FULL, a2, src);
+      uint32_t q0 = __shfl_sync(FULL, a1, src);
+      uint32_t q2 = __shfl_sync(FULL, a3, src);
+      const __nv_bfloat162 p0 = *reinterpret_cast<__nv_bfloat162*>(&r0);
+      const __nv_bfloat162 p2 = *reinterpret_cast<__nv_bfloat162*>(&r2);
+      const __nv_bfloat162 qA = *reinterpret_cast<__nv_bfloat162*>(&q0);
+      const __nv_bfloat162 qB = *reinterpret_cast<__nv_bfloat162*>(&q2);
+      ag[2 * tt] = __bfloat162float(p0.x); ag[2 * tt + 1] = __bfloat162float(p0.y);
+      ag[2 * tt + 8] = __bfloat162float(p2.x); ag[2 * tt + 9] = __bfloat162float(p2.y);
+      ag8[2 * tt] = __bfloat162float(qA.x); ag8[2 * tt + 1] = __bfloat162float(qA.y);
+      ag8[2 * tt + 8] = __bfloat162float(qB.x); ag8[2 * tt + 9] = __bfloat162float(qB.y);
+    }
+
+    // Gather B columns 2t and 2t+1 (all 16 k-values each). Column n is owned by
+    // group n, so its values live in lanes n*4 .. n*4+3.
+    float bc0[16], bc1[16];
+    #pragma unroll
+    for (int tt = 0; tt < 4; ++tt) {
+      const int srcA = (2 * t) * 4 + tt;
+      const int srcB = (2 * t + 1) * 4 + tt;
+      uint32_t uA = __shfl_sync(FULL, b0, srcA);
+      uint32_t uA8 = __shfl_sync(FULL, b1, srcA);
+      uint32_t uB = __shfl_sync(FULL, b0, srcB);
+      uint32_t uB8 = __shfl_sync(FULL, b1, srcB);
+      const __nv_bfloat162 vA = *reinterpret_cast<__nv_bfloat162*>(&uA);
+      const __nv_bfloat162 vA8 = *reinterpret_cast<__nv_bfloat162*>(&uA8);
+      const __nv_bfloat162 vB = *reinterpret_cast<__nv_bfloat162*>(&uB);
+      const __nv_bfloat162 vB8 = *reinterpret_cast<__nv_bfloat162*>(&uB8);
+      bc0[2 * tt] = __bfloat162float(vA.x); bc0[2 * tt + 1] = __bfloat162float(vA.y);
+      bc0[2 * tt + 8] = __bfloat162float(vA8.x); bc0[2 * tt + 9] = __bfloat162float(vA8.y);
+      bc1[2 * tt] = __bfloat162float(vB.x); bc1[2 * tt + 1] = __bfloat162float(vB.y);
+      bc1[2 * tt + 8] = __bfloat162float(vB8.x); bc1[2 * tt + 9] = __bfloat162float(vB8.y);
+    }
+
+    // Exact K-reduction for the 4 D elements this thread owns.
+    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) {
+      s0 = fmaf(ag[k], bc0[k], s0);
+      s1 = fmaf(ag[k], bc1[k], s1);
+      s2 = fmaf(ag8[k], bc0[k], s2);
+      s3 = fmaf(ag8[k], bc1[k], s3);
+    }
+    d[0] += s0;
+    d[1] += s1;
+    d[2] += s2;
+    d[3] += s3;
+  }
 #endif
 }
 
