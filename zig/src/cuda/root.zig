@@ -31,6 +31,7 @@ pub const triton = @import("triton.zig");
 pub const aot = @import("aot.zig");
 pub const kernels = @import("kernels.zig");
 pub const qmmf = @import("qmmf.zig");
+pub const volta = @import("volta.zig");
 pub const fp8 = @import("fp8.zig");
 pub const mxfp8 = @import("mxfp8.zig");
 pub const exlr8 = @import("exlr8.zig");
@@ -97,6 +98,7 @@ test {
     _ = aot;
     _ = segments;
     _ = @import("qmmf.zig");
+    _ = @import("volta.zig");
     _ = @import("fp8.zig");
     _ = @import("mxfp8.zig");
     _ = carveout;

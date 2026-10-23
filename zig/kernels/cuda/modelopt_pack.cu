@@ -37,6 +37,28 @@ extern "C" __global__ void __launch_bounds__(256) tf_pack_bf16_lane(const uint16
   out[i] = row < n ? w[row * k + col] : 0;
 }
 
+// One e4m3 byte -> the exact bf16 it represents (e4m3 is a subset of bf16's values;
+// subnormals (exp=0) round to 0 -- never present in quantized weights).
+__device__ __forceinline__ uint16_t e4m3_to_bf16(uint8_t b) {
+    const uint8_t s = b & 0x80u, e4 = (b >> 3) & 0xFu, m3 = b & 0x7u;
+    if (e4 == 0) return (uint16_t)(s << 8);
+    return (uint16_t)((s << 8) | (((uint16_t)e4 + 120u) << 7) | (m3 << 4));
+}
+
+// e4m3 codes [n, k] at `codes` (as uploaded) into `out` as a packed BF16 lane weight: the same
+// tf_pack_bf16_lane permutation, but each value is its e4m3 byte decoded to bf16. Lets a ModelOpt
+// FP8 projection run through the validated Volta bf16 GEMM (W8A16, input left as the real bf16).
+extern "C" __global__ void __launch_bounds__(256) tf_dequant_fp8_to_bf16lane(const uint8_t* __restrict__ codes, uint16_t* __restrict__ out, int n, int k, long long total) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int e = i % 4, lane = (i / 4) % 32, kt = (i / 128) % 4, jj = (i / 512) % 8;
+    const long long tg = i / 4096;
+    const int kg = k / 64, g = tg % kg;
+    const long long row = (tg / kg) * 64 + jj * 8 + lane / 4;
+    const int col = g * 64 + kt * 16 + 2 * (lane % 4) + (e & 1) + 8 * (e >> 1);
+    out[i] = row < n ? e4m3_to_bf16(codes[row * k + col]) : 0;
+}
+
 // NVFP4 codes [n, k/2] (low nibble first) into words [npad/64][k/64][8][32][2], rows past n zero (nvfp4.packWords).
 extern "C" __global__ void __launch_bounds__(256) tf_pack_fp4_words(const uint8_t* __restrict__ codes, uint32_t* __restrict__ out,
                                                                     int n, int k, long long total) {

@@ -18,11 +18,19 @@ constexpr float LOG2E = 1.4426950408889634f;
 constexpr int SMEM_MAX = 96 * 1024;
 
 template <int N>
-__device__ __forceinline__ void wait_group() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void wait_group() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
+}
 
 __device__ __forceinline__ void ldmatrix4t(uint32_t (&r)[4], const void* p) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(qmm_frag::smem(p)));
+#else
+    (void)r; (void)p; asm volatile("trap;");
+#endif
 }
 
 __device__ __forceinline__ float texp(float x) {

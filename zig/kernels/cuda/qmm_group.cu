@@ -1,6 +1,7 @@
 // Device code of src/tensorfold/cuda/kernels/qmm_group.cu (lines 1-348, comments and ATen includes dropped), checked by zig/tests/cuda/copies.py.
 
 #include <algorithm>
+#include "tf_bf16_fma.cuh"
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -34,7 +35,7 @@ __device__ __forceinline__ uint32_t pairm(uint32_t w, int s, uint32_t mask) {
 #if __CUDA_ARCH__ >= 900
     asm("sub.rn.bf16x2 %0, %1, %2;\n" : "=r"(r) : "r"(t), "r"(0x43004300u));
 #else
-    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x3F803F80u), "r"(0xC300C300u));
+    r = tf_bf16x2_fma(t, 0x3F803F80u, 0xC300C300u);
 #endif
     return r;
 }

@@ -1,6 +1,7 @@
 // Device code of src/tensorfold/cuda/experts_prefill.cu (lines 1-153, comments and ATen includes dropped), checked by zig/tests/cuda/copies.py.
 
 #include <cuda_bf16.h>
+#include "tf_bf16_fma.cuh"
 #include <stdint.h>
 
 #include "experts.cuh"
@@ -20,9 +21,23 @@ struct Pre {
 };
 
 __device__ __forceinline__ uint32_t hfma2(uint32_t q, uint32_t s, uint32_t b) {
-  __nv_bfloat162 r = __hfma2(*reinterpret_cast<__nv_bfloat162*>(&q), *reinterpret_cast<__nv_bfloat162*>(&s),
-                             *reinterpret_cast<__nv_bfloat162*>(&b));
-  return *reinterpret_cast<uint32_t*>(&r);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  uint32_t r;
+  r = tf_bf16x2_fma(q, s, b);
+  return r;
+#else
+  // Software emulation for sm_70: unpack bf16 pairs, FMA in fp32, repack
+  const __nv_bfloat16* qa = reinterpret_cast<const __nv_bfloat16*>(&q);
+  const __nv_bfloat16* sa = reinterpret_cast<const __nv_bfloat16*>(&s);
+  const __nv_bfloat16* ba = reinterpret_cast<const __nv_bfloat16*>(&b);
+  float r0 = __bfloat162float(qa[0]) * __bfloat162float(sa[0]) + __bfloat162float(ba[0]);
+  float r1 = __bfloat162float(qa[1]) * __bfloat162float(sa[1]) + __bfloat162float(ba[1]);
+  uint32_t r;
+  __nv_bfloat16* ra = reinterpret_cast<__nv_bfloat16*>(&r);
+  ra[0] = __float2bfloat16_rn(r0);
+  ra[1] = __float2bfloat16_rn(r1);
+  return r;
+#endif
 }
 
 template <int GS, int M, int EPI, int RT, int WM, int WN>

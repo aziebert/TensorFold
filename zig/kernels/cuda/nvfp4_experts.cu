@@ -1,6 +1,7 @@
 // Device code of nvfp4/experts.cu (lines 14-149, host launchers, comments and ATen dropped) and its instances.
 
 #include <cuda_bf16.h>
+#include "tf_bf16_fma.cuh"
 #include <cuda_fp8.h>
 #include <stdint.h>
 
@@ -11,18 +12,23 @@ namespace tf_nvfp4_experts {
 constexpr int BLOCK4 = 36;
 
 __device__ __forceinline__ uint4 ld_nc(const uint4* p) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
   uint4 r;
   asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];\n"
                : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
                : "l"(p));
   return r;
+#else
+  // sm_70 fallback: regular non-coherent load
+  return __ldg(p);
+#endif
 }
 
 __device__ __forceinline__ uint32_t fp4pair(uint32_t w, int s) {
   const uint32_t v = w >> s;
   const uint32_t t = ((v & 0x00070007u) << 6) | ((v & 0x00080008u) << 12);
   uint32_t r;
-  asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7E807E80u), "r"(0x80008000u));
+  r = tf_bf16x2_fma(t, 0x7E807E80u, 0x80008000u);
   return r;
 }
 
@@ -155,14 +161,14 @@ struct Prompt4 {
 __device__ __forceinline__ uint32_t e4m3x2(uint32_t x) {
   const uint32_t t = ((x & 0x007F007Fu) << 4) | ((x & 0x00800080u) << 8);
   uint32_t r;
-  asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7B807B80u), "r"(0x80008000u));
+  r = tf_bf16x2_fma(t, 0x7B807B80u, 0x80008000u);
   return r;
 }
 
 // a * b in bf16 pairs; exact for e2m1 codes times e4m3 scales (six significant bits at most).
 __device__ __forceinline__ uint32_t mul2(uint32_t a, uint32_t b) {
   uint32_t r;
-  asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(a), "r"(b), "r"(0x80008000u));
+  r = tf_bf16x2_fma(a, b, 0x80008000u);
   return r;
 }
 

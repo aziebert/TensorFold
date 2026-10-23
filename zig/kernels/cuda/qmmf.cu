@@ -1,6 +1,7 @@
 // Device code of nvfp4/qmmf.cu (lines 14-298, comments and ATen dropped), its FP4, FP8 and FP8G modes plus BF16.
 
 #include <algorithm>
+#include "tf_bf16_fma.cuh"
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -20,7 +21,7 @@ __device__ __forceinline__ uint32_t fp4pair(uint32_t w, int s) {
     const uint32_t v = w >> s;
     const uint32_t t = ((v & 0x00070007u) << 6) | ((v & 0x00080008u) << 12);
     uint32_t r;
-    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7E807E80u), "r"(0x80008000u));
+    r = tf_bf16x2_fma(t, 0x7E807E80u, 0x80008000u);
     return r;
 }
 
@@ -28,7 +29,7 @@ __device__ __forceinline__ uint32_t fp8pair(uint32_t w) {
     const uint32_t x = (w & 0xFFu) | ((w & 0xFF00u) << 8);
     const uint32_t t = ((x & 0x007F007Fu) << 4) | ((x & 0x00800080u) << 8);
     uint32_t r;
-    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7B807B80u), "r"(0x80008000u));
+    r = tf_bf16x2_fma(t, 0x7B807B80u, 0x80008000u);
     return r;
 }
 

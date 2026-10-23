@@ -110,18 +110,26 @@ pub fn dense(L: *Loader, ck: *core.Checkpoint, label: []const u8, prefixes: []co
     switch (first.kind) {
         .q8_0, .iq2xxs => return ggmlDense(L, label, parts[0..prefixes.len], n, k),
         .bf16, .fp8 => {
-            const size: usize = if (first.kind == .bf16) 2 else 1;
+            // Volta has no block-scaled FP8 matmul: run an FP8 projection W8A16 through the validated
+            // bf16 GEMM (dequant e4m3 -> bf16). Blackwell keeps the native FP8 (W8A8 checkpoint math).
+            const to_bf16: bool = first.kind == .fp8 and L.ops.k.volta_lane != null;
+            const size: usize = if (first.kind == .bf16) 2 else 1;             // raw bytes/element uploaded
+            const out_size: usize = if (first.kind == .bf16 or to_bf16) 2 else 1; // packed bytes/element
             const base = try L.tmp(n * k * size);
             var at: usize = 0;
             for (parts[0..prefixes.len]) |p| {
                 try L.src.upload(base + at, p.w.bytes);
                 at += p.w.bytes.len;
             }
-            const out = try L.alloc(try name(&buf, "{s}.weight", .{label}), cuda.modelopt.padded(n) * k * size);
+            const out = try L.alloc(try name(&buf, "{s}.weight", .{label}), cuda.modelopt.padded(n) * k * out_size);
             try L.src.flush();
             if (first.kind == .bf16) {
                 try m.pack.bf16Lane(s, base, out, n, k);
                 return .{ .bf16 = cuda.modelopt.bf16Weight(out, n, k) };
+            }
+            if (to_bf16) {
+                try m.pack.fp8ToBf16Lane(s, base, out, n, k);
+                return .{ .bf16 = cuda.modelopt.bf16WeightScaled(out, first.scale, n, k) };
             }
             try m.pack.fp8Lane(s, base, out, n, k);
             var w = cuda.modelopt.fp8Weight(out, first.scale, n, k);

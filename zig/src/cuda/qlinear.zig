@@ -10,6 +10,7 @@ const nvfp4 = @import("nvfp4.zig");
 const ck = @import("ck.zig");
 const exl3 = @import("exl3.zig");
 const ggml = @import("ggml.zig");
+const volta = @import("volta.zig");
 const Driver = driver.Driver;
 const Module = module.Module;
 const Function = module.Function;
@@ -95,6 +96,7 @@ pub const Rows = struct { x: u64, ldx: usize = 0, sums: u64 = 0, part: u64 = 0 }
 pub const Linear = struct {
     affine4: ?*const Affine4Kernels = null,
     lane: ?*const qmmf.Lane = null, // decode rows of every lane format; fp8g and bf16 prompt rows too
+    volta_lane: ?*const volta.Lane = null, // Volta (sm_70) decode: FP4 rows via the volta_qmm prep + tensor-core GEMM
     nvfp4_prompt: ?*const nvfp4.Prompt = null, // the prompt GEMM: nvfp4 and fp8 prompt rows (linear.py's prefill)
     ck: ?*const ck.Ck = null, // the checkpoint's own math: an fp8 weight with an input scale takes e4m3 rows
     ck_rows: u64 = 0, // its e4m3 rows (at least rows * k bytes), and slice partials where no cluster meets them
@@ -196,6 +198,8 @@ pub const Linear = struct {
         kind: qmmf.Out,
         rows: usize,
     ) !void {
+        // Volta (sm_70): use the volta_lane for FP4 and FP8 prompt rows (tensor-core GEMM without sm_80+ PTX)
+        if (mode == .fp4 or mode == .fp8) if (l.volta_lane) |v| return onVoltaLane(v, s, q, in, out, kind, rows);
         const p = l.nvfp4_prompt orelse return error.FormatNotLoaded;
         if (q.mode != mode) return error.FormatMismatch;
         return p.matmulOut(s, in.x, if (in.ldx == 0) q.k else in.ldx, rows, q, out, kind);
@@ -215,9 +219,74 @@ pub const Linear = struct {
         kind: qmmf.Out,
         rows: usize,
     ) !void {
+        if (mode == .fp4 or mode == .fp8) if (l.volta_lane) |v| return onVoltaLane(v, s, q, in, out, kind, rows);
+        // Volta (sm_70): dense BF16 rows have no sm_80-free kernel in the generic lane; take the
+        // tensor-core GEMM here when the row stride is 16B-aligned (the int4 loads require it).
+        if (mode == .bf16) if (l.volta_lane) |v| {
+            const eldx: usize = if (in.ldx == 0) q.k else in.ldx;
+            if (eldx % 8 == 0) return onVoltaBf16(v, s, q, in, out, kind, rows);
+        };
         const lane = l.lane orelse return error.FormatNotLoaded;
         if (q.mode != mode) return error.FormatMismatch;
         return lane.matmulOut(s, in.x, if (in.ldx == 0) q.k else in.ldx, rows, q, out, kind, in.part);
+    }
+
+    /// Volta rows: the bf16 input through the prep (bf16 -> fp16 + row scales), the tile, and the
+    /// tensor-core GEMM; the weight's tensor scale broadcast is the per-column alpha.
+    fn onVoltaLane(v: *const volta.Lane, s: Stream, q: qmmf.Weight, in: Rows, out: u64, kind: qmmf.Out, rows: usize) !void {
+        const d = v.d;
+        const m: u32 = @intCast(rows);
+        const n = q.n;
+        const k = q.k;
+        const out_f32 = kind == .f32;
+        // Determine the format: 0=fp4, 1=fp8, 2=mxfp8
+        const fmt: u32 = if (q.mode == .fp4) 0 else if (q.mode == .fp8) 1 else 2;
+        var alpha = try memory.DeviceBuffer.alloc(d, @as(usize, n) * 4);
+        errdefer alpha.free();
+        // The fp4 e2m1 decode (fp4x8 in qmmf_volta.cu) yields value * 2^-14 so the scaled
+        // input keeps the fp16 mma product in range; that shift is never undone in the epilogue.
+        // Compensate it in the per-column alpha for fp4 only (fp8/mxfp8 decode true codes).
+        const alpha_f32: f32 = if (fmt == 0) q.scale * 16384.0 else q.scale;
+        try d.check(d.api.cuMemsetD32_v2(alpha.ptr, @bitCast(alpha_f32), @as(usize, n)), "cuMemsetD32");
+        const ldx: u32 = if (in.ldx == 0) q.k else @intCast(in.ldx);
+        // Allocate the intermediate buffers
+        const xbytes: u64 = @as(u64, m) * @as(u64, k) * 2; // fp16 [m, k]
+        const xtbytes: u64 = ((@as(u64, m) + 7) / 8) * @as(u64, k) * 16; // tiled: rowtiles*K int4 (16 B each)
+        var x16 = try memory.DeviceBuffer.alloc(d, @intCast(xbytes));
+        errdefer x16.free();
+        var xt = try memory.DeviceBuffer.alloc(d, @intCast(xtbytes));
+        errdefer xt.free();
+        var rs = try memory.DeviceBuffer.alloc(d, @as(usize, m) * 4); // float [m]
+        errdefer rs.free();
+        const p = volta.Lane.plan(n, k, m);
+        var part = try memory.DeviceBuffer.alloc(d, if (p.sk > 1) @intCast(volta.Lane.partBytes(m, n, p.sk)) else 0);
+        errdefer part.free();
+        var cnt = try memory.DeviceBuffer.alloc(d, if (p.sk > 1) @intCast(volta.Lane.cntBytes(m, n, p)) else 0);
+        errdefer cnt.free();
+        if (p.sk > 1) try cnt.fill32(0, s.handle);
+        // Convert bf16 to fp16 + row scales, tile it, and run the GEMM
+        try v.prep(s, in.x, ldx, m, k, x16.ptr, rs.ptr);
+        try v.tileX(s, x16.ptr, xt.ptr, m, k);
+        return v.matmul(s, xt.ptr, rs.ptr, q.codes, q.scales, alpha.ptr, out, if (p.sk > 1) part.ptr else 0, if (p.sk > 1) cnt.ptr else 0, m, n, k, fmt, out_f32);
+    }
+
+    /// Volta (sm_70) dense BF16 rows: raw bf16 input straight into the tensor-core GEMM (tf_vbf16_*);
+    /// both operands convert to fp16 in-kernel and the single weight factor `scale` lands in the
+    /// epilogue. `in.x` must be 16B-row-aligned (checked by the caller) and `ldx` a multiple of 8.
+    fn onVoltaBf16(v: *const volta.Lane, s: Stream, q: qmmf.Weight, in: Rows, out: u64, kind: qmmf.Out, rows: usize) !void {
+        const d = v.d;
+        const m: u32 = @intCast(rows);
+        const n = q.n;
+        const k = q.k;
+        const out_f32 = kind == .f32;
+        const ldx: u32 = if (in.ldx == 0) q.k else @intCast(in.ldx);
+        const p = volta.Lane.plan(n, k, m);
+        var part = try memory.DeviceBuffer.alloc(d, if (p.sk > 1) @intCast(volta.Lane.partBytes(m, n, p.sk)) else 0);
+        errdefer part.free();
+        var cnt = try memory.DeviceBuffer.alloc(d, if (p.sk > 1) @intCast(volta.Lane.cntBytes(m, n, p)) else 0);
+        errdefer cnt.free();
+        if (p.sk > 1) try cnt.fill32(0, s.handle);
+        return v.matmulBf16(s, in.x, ldx, q.codes, q.scale, out, if (p.sk > 1) part.ptr else 0, if (p.sk > 1) cnt.ptr else 0, m, n, k, out_f32);
     }
 };
 
@@ -299,9 +368,9 @@ pub fn splitSmem(bits: u8) u32 {
     return if (bits == 8) 25856 else 9472 + 2048 * @as(u32, bits);
 }
 
-/// affine8.cu's Prefill<bits>::SMEM: the prompt GEMM's three stages.
+/// affine8.cu's Prefill<bits>::SMEM: the prompt GEMM's two stages.
 pub fn prefillSmem(bits: u8) u32 {
-    return 50688 + 3072 * @as(u32, bits);
+    return 33792 + 2048 * @as(u32, bits);
 }
 
 /// The widths AffineNKernels serves, in the order of its function tables.

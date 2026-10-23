@@ -67,8 +67,9 @@ pub const Kernels = struct {
     draws: cuda.sample.Draws, // sample.cu: the keyed draws and logprob rows
     grammar_mask: cuda.Function, // structured output: disallowed tokens -inf before the draw
     torch: torch_ops.Functions,
-    train: train_ops.Kernels, // Sliding Weights' learning step, and the learned change a forward adds while lessons run
+    train: ?train_ops.Kernels, // Sliding Weights' learning step, and the learned change a forward adds while lessons run (null on sm < 80)
     modelopt: ?Modelopt = null, // loaded by loadModelopt for a ModelOpt checkpoint, else never
+    volta_lane: ?cuda.volta.Lane = null, // loaded by loadVolta for FP4 decode on sm_70
     latent: ?@import("cuda_latent.zig").Fns = null, // a latent MoE's glue (loadLatent), else never
     ck: ?cuda.ck.Ck = null, // the checkpoint's own math (loadCk): FP8 rows and NVFP4 experts, sm_120 on
     ggml: ?cuda.ggml.Kernels = null, // loaded by loadGgml for a checkpoint with ggml blocks (Bolt's IQ2_XXS and Q8_0)
@@ -116,8 +117,12 @@ pub const Kernels = struct {
         k.ggml = null;
         k.triton = if (triton_dir) |dir| try cuda.aot.Set.load(gpa, io, d, ctx.device, dir) else null;
         errdefer if (k.triton) |*t| t.deinit();
-        k.train = try train_ops.Kernels.load(d);
-        errdefer k.train.deinit();
+        if (kk.train.len > 0) {
+            k.train = try train_ops.Kernels.load(d);
+            errdefer k.train.?.deinit();
+        } else {
+            k.train = null;
+        }
         try k.pattn.allowDynamicShared(pattn_smem);
         const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
         k.experts = try cuda.experts.Affine4Experts.resolve(k.mods[2], k.mods[3], k.mods[4], sms);
@@ -134,6 +139,7 @@ pub const Kernels = struct {
         k.norms.unload();
         if (k.latent) |*x| x.unload();
         if (k.ck) |*x| x.unload();
+        if (k.volta_lane) |*v| v.unload();
         if (k.modelopt) |*m| {
             m.lane.unload();
             m.gemm.unload();
@@ -142,7 +148,7 @@ pub const Kernels = struct {
         }
         if (k.ggml) |*g| g.unload();
         k.affine.deinit();
-        k.train.deinit();
+        if (k.train) |*t| t.deinit();
         if (k.triton) |*t| t.deinit();
         for (&k.mods) |*m| m.unload();
     }
@@ -182,13 +188,21 @@ pub const Kernels = struct {
         _ = ctx;
         k.ggml = try cuda.ggml.Kernels.load(k.d);
     }
+
+    /// The Volta FP4 decode lane (prep + tile + tensor-core GEMM): sm_70 only, a no-op elsewhere.
+    pub fn loadVolta(k: *Kernels, ctx: *const cuda.Context) !void {
+        if (k.volta_lane != null) return;
+        const major: u32 = @intCast(try ctx.attribute(.compute_capability_major));
+        if (major != 7) return; // not Volta: nothing to load
+        k.volta_lane = try cuda.volta.Lane.load(k.d);
+    }
 };
 
 /// The checkpoint's own math needs this major capability: the block-scaled FP4 mma (sm_120a, sm_121a).
 pub const ck_major: u32 = 12;
 
-/// FP8 and NVFP4 paths stop below this full capability: they decode to bf16 for mma.sync.
-pub const modelopt_min: u32 = 80;
+/// FP8 and NVFP4 paths decode to bf16 for mma.sync; Volta (sm_70) supported with guarded PTX.
+pub const modelopt_min: u32 = 70;
 
 /// Why a ModelOpt checkpoint cannot load at `capability` (10 * major + minor), or null when it may.
 pub fn modeloptRefusal(capability: u32) ?[]const u8 {
@@ -229,7 +243,8 @@ pub const Ops = struct {
 
     /// The training kernels (and the change's forward) on this stream.
     pub fn train(o: Ops) train_ops.Ops {
-        return .{ .k = &o.k.train, .s = o.s };
+        if (o.k.train) |t| return .{ .k = &t, .s = o.s };
+        @panic("training kernels not available on this architecture");
     }
 
     /// sample.cu's keyed draw on this stream (cuda/sample.zig, the launch unchanged).
@@ -255,7 +270,7 @@ pub const Ops = struct {
     /// Every projection format the kernels loaded (cuda/qlinear.zig).
     pub fn linear(o: Ops) cuda.qlinear.Linear {
         const m = if (o.k.modelopt) |*x| x else null;
-        return .{ .affine4 = &o.k.affine, .lane = if (m) |x| &x.lane else null, .nvfp4_prompt = if (m) |x| &x.gemm else null, .ck = if (o.k.ck) |*x| x else null, .ck_rows = o.ck8, .ggml = if (o.k.ggml) |*g| g else null };
+        return .{ .affine4 = &o.k.affine, .lane = if (m) |x| &x.lane else null, .nvfp4_prompt = if (m) |x| &x.gemm else null, .ck = if (o.k.ck) |*x| x else null, .ck_rows = o.ck8, .ggml = if (o.k.ggml) |*g| g else null, .volta_lane = if (o.k.volta_lane) |*v| v else null };
     }
 
     /// Every grouped-expert format the kernels loaded (cuda/experts.zig).

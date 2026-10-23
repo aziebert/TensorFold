@@ -260,7 +260,8 @@ pub const Trainer = struct {
     }
 
     pub fn ops_(t: *const Trainer) ops.Ops {
-        return .{ .k = &t.e.k.train, .s = t.e.stream };
+        if (t.e.k.train) |tr| return .{ .k = &tr, .s = t.e.stream };
+        @panic("training kernels not available");
     }
 
     /// The raw weights the backward's products read, and the LM head dequantized once.

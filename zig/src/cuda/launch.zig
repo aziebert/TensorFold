@@ -114,7 +114,9 @@ fn launched(f: Function, cfg: Config, res: abi.Result, what: []const u8) Error!v
     if (res == abi.error_not_ready) return error.NotReady;
     const d = f.d;
     var buf: [160]u8 = undefined;
-    std.log.err("{s}: {s} ({d}) {s}; {s}{s}", .{ what, d.errorName(res), res, d.errorText(res), describe(&buf, d.functionName(f.handle), cfg), driver.shutdownNote(res) });
+    var name = d.functionName(f.handle);
+    if (std.mem.eql(u8, name, "?")) name = f.name orelse name;
+    std.log.err("{s}: {s} ({d}) {s}; {s}{s}", .{ what, d.errorName(res), res, d.errorText(res), describe(&buf, name, cfg), driver.shutdownNote(res) });
     return driver.Driver.errorOf(res);
 }
 

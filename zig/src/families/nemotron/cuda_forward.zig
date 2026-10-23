@@ -445,11 +445,8 @@ pub const Forward = struct {
             .attention => {
                 const kc = f.cache(b, b.k_cache, w.aj);
                 const vc = f.cache(b, b.v_cache, w.aj);
-                const qd = c.heads * c.head_dim;
                 try f.glue.kvWrite(b.qkv, kc, vc, b.p_meta, w.rows, f.ashape());
-                try o.torch().copyRows(b.qkv, c.qkvDim() * 2, b.q, qd * 2, qd * 2, w.rows);
-                const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(c.head_dim), -0.5));
-                try o.prefillAttention(b.q, kc, vc, b.att, w.pos, w.rows, c.heads, c.kv_heads, scale, b.table, f.page_elems);
+                try f.glue.attention(b.qkv, kc, vc, b.p_meta, b.po, b.pm, b.pl, b.att, b.axs, w.rows, f.ashape());
             },
             .moe => {},
         }
@@ -521,10 +518,13 @@ pub const Forward = struct {
 
 /// y += scale (x a^T) b over the blocks `route` opens on each row (x and y rows their strides apart, y bf16 or fp32).
 fn adapt(o: kern.Ops, ad: weights.Adapter, x: u64, x_stride: usize, y: u64, y_stride: usize, y_f32: bool, rows: usize, route: *const lesson_route.Route) !void {
-    const t: train_ops.Ops = .{ .k = &o.k.train, .s = o.s };
+    if (o.k.train) |tr| {
+    const t: train_ops.Ops = .{ .k = &tr, .s = o.s };
     try t.loraIn(x, x_stride, ad.a, ad.xa, rows, ad.in, ad.rank, ad.xn);
     var r = route.*;
     if (ad.whole) r.whole = 1;
     try t.gate(ad.xa, ad.xn, ad.tau, ad.gates, rows, ad.rank, ad.unit, &r, ad.latch, ad.score);
     try t.loraOut(ad.xa, ad.b, y, y_stride, y_f32, rows, ad.out, ad.rank, ad.scale);
+    }
+    return; // training kernels not available: skip the learned change
 }

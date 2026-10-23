@@ -1,6 +1,7 @@
 // Device code of src/tensorfold/cuda/kernels/qmm_prefill.cu (lines 1-151, comments and ATen includes dropped), checked by zig/tests/cuda/copies.py.
 
 #include <algorithm>
+#include "tf_bf16_fma.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -26,7 +27,7 @@ struct Tile {
 
 __device__ __forceinline__ uint32_t fma2(uint32_t a, uint32_t b, uint32_t c) {
     uint32_t d;
-    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    d = tf_bf16x2_fma(a, b, c);
     return d;
 }
 

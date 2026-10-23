@@ -137,3 +137,10 @@ pub const train_attn: []const u8 = if (available) &Blob("fatbin_train_attn").byt
 pub const flashnext_train: []const u8 = if (available) &Blob("fatbin_flashnext_train").bytes else &.{};
 pub const attn_train: []const u8 = if (available) &Blob("fatbin_attn_train").bytes else &.{};
 pub const qwen27_train: []const u8 = if (available) &Blob("fatbin_qwen27_train").bytes else &.{};
+
+// Volta (sm_70, Quadro GV100) engine-form fatbins — the runtime selects these at compute capability 70.
+pub const attention_volta: []const u8 = if (available) &Blob("fatbin_attention_volta").bytes else &.{};
+pub const volta_qmm: []const u8 = if (available) &Blob("fatbin_volta_qmm").bytes else &.{};
+pub const qmmf_volta: []const u8 = if (available) &Blob("fatbin_qmmf_volta").bytes else &.{};
+pub const experts_volta: []const u8 = if (available) &Blob("fatbin_experts_volta").bytes else &.{};
+pub const draft_attention_volta: []const u8 = if (available) &Blob("fatbin_draft_attention_volta").bytes else &.{};

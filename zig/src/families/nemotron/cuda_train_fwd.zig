@@ -95,7 +95,8 @@ pub fn experts(f: *const fwd.Forward, m: weights.MoE, rows: usize, scale: Scale,
     try g.prompt(o.s, .up, in[0], ex, b.plan, b.act, items, -1);
     try g.prompt(o.s, .down_bf16, in[1], ex, b.plan, b.ymoe, items, -1);
     for (m.rest, 0..) |r, h| if (r != 0) try o.restRows(b.act, ex.width, r, b.ymoe, ex.dims, false, rows, c.slots(), c.top_k + h, ex.dims, ex.width);
-    const t: train_ops.Ops = .{ .k = &o.k.train, .s = o.s };
+    if (o.k.train) |tr| {
+    const t: train_ops.Ops = .{ .k = &tr, .s = o.s };
     if (m.pocket) |p| try t.pocketRows(b.y, ex.dims, p.up, p.down, p.n, b.ymoe, false, rows, c.slots(), c.top_k, scale.rows, scale.from[layer]);
     const ad = m.adapter orelse return;
     const x = b.act + @as(u64, c.top_k) * ex.width * 2;
@@ -105,4 +106,5 @@ pub fn experts(f: *const fwd.Forward, m: weights.MoE, rows: usize, scale: Scale,
     if (ad.whole) r.whole = 1;
     try t.gate(ad.xa, ad.xn, ad.tau, ad.gates, rows, ad.rank, ad.unit, &r, ad.latch, ad.score);
     try t.loraOut(ad.xa, ad.b, y, c.slots() * ex.dims, false, rows, ad.out, ad.rank, ad.scale);
+    }
 }

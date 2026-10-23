@@ -43,8 +43,12 @@ constexpr int TW = 16;     // words of a K step a stage holds
 constexpr int TS = TW + 4;  // a staged row's words: 16-byte copies, eight rows in a quarter warp on distinct banks
 
 __device__ __forceinline__ void cp16(uint32_t* dst, const void* src, bool read) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     const uint32_t at = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(at), "l"(src), "r"(read ? 16 : 0));
+#else
+    if (read) reinterpret_cast<uint4*>(dst)[0] = *reinterpret_cast<const uint4*>(src);
+#endif
 }
 
 __device__ __forceinline__ uint32_t word(uint4 v, int w) { return w == 0 ? v.x : w == 1 ? v.y : w == 2 ? v.z : v.w; }
@@ -75,16 +79,26 @@ tf_nemo_router_tiles(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* _
                 (wr ? W : X) + static_cast<int64_t>(live ? at : 0) * D + k0 + step * 2 * TW + q * 8;
             cp16(st + (wr * TT + r) * TS + q * 4, src, live);
         }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
         asm volatile("cp.async.commit_group;\n" ::);
+#endif
     };
     float acc[8][8] = {};
     load(0);
     for (int step = 0; step < steps; ++step) {
         if (step + 1 < steps) {
             load(step + 1);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
             asm volatile("cp.async.wait_group 1;\n" ::);
+#else
+            __syncthreads();
+#endif
         } else {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
             asm volatile("cp.async.wait_group 0;\n" ::);
+#else
+            __syncthreads();
+#endif
         }
         __syncthreads();
         const uint32_t* xs = staged + (step & 1) * 2 * TT * TS;

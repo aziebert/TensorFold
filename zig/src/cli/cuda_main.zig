@@ -212,7 +212,33 @@ pub fn main(init: std.process.Init) !u8 {
         };
         return 0;
     };
-    const engine = nemotron.Engine.init(gpa, init.io, &ctx, opts.model, kernels, .{ .context = opts.context, .mtp = mtp, .graphs = graphs, .sampling = sampling, .segments = segments, .carveout = if (carve) |*c| c else null, .precision = opts.math }) catch |err| {
+    const model_dir: []const u8 = blk: {
+        const cwd = std.Io.Dir.cwd();
+        // If it's a directory, use it directly
+        if (cwd.access(init.io, opts.model, .{})) |_| {
+            break :blk opts.model;
+        } else |_| {}
+        // Try to resolve as a Hugging Face repo id (owner/name)
+        const slash_idx = std.mem.indexOfScalar(u8, opts.model, '/') orelse {
+            std.debug.print("error: {s} is neither a directory nor a Hugging Face repo id (owner/name)\n", .{opts.model});
+            return 1;
+        };
+        const owner = opts.model[0..slash_idx];
+        const name = opts.model[slash_idx + 1 ..];
+        const hf_cache = init.environ_map.get("HF_HOME") orelse "/home/alex/.cache/huggingface";
+        const repo_dir = try std.fmt.allocPrint(gpa, "{s}/hub/models--{s}--{s}", .{hf_cache, owner, name});
+        const refs_file = try std.fmt.allocPrint(gpa, "{s}/refs/main", .{repo_dir});
+        if (cwd.readFileAlloc(init.io, refs_file, gpa, .limited(16 << 20))) |ref| {
+            defer gpa.free(ref);
+            const rev = std.mem.trim(u8, ref, " \r\n");
+            const snapshot_dir = try std.fmt.allocPrint(gpa, "{s}/snapshots/{s}", .{repo_dir, rev});
+            break :blk snapshot_dir;
+        } else |_| {
+            std.debug.print("error: {s} is not in the Hugging Face cache; run: tensorfold pull {s}\n", .{opts.model, opts.model});
+            return 1;
+        }
+    };
+    const engine = nemotron.Engine.init(gpa, init.io, &ctx, model_dir, kernels, .{ .context = opts.context, .mtp = mtp, .graphs = graphs, .sampling = sampling, .segments = segments, .carveout = if (carve) |*c| c else null, .precision = opts.math }) catch |err| {
         cuda.tp_watch.fail(@errorName(err)); // the other ranks stop with this error
         return err;
     };

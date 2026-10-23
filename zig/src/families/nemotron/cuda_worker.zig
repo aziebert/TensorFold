@@ -123,6 +123,7 @@ pub fn serve(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
     defer stream.deinit();
     var k = try kern.Kernels.load(gpa, io, ctx, null);
     defer k.deinit();
+    try k.loadVolta(ctx);
     try k.loadModelopt(ctx);
     try k.loadLatent();
     if (c.ck) try k.loadCk(ctx);

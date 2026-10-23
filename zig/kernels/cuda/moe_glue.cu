@@ -118,10 +118,17 @@ extern "C" __global__ void __launch_bounds__(256) tf_moe_topk_sigmoid_warp(const
             const int e = lane + 32 * j;
             if (e < ne && beats(v[j], e, bv, bi)) bv = v[j], bi = e;
         }
-        { // the warp's best: the largest value (redux on an order-keeping key), then the lowest id among equals
+        { // the warp's best: the largest value (warp reduce on an order-keeping key), then the lowest id among equals
             const unsigned key = ordered(bv);
-            const unsigned top = __reduce_max_sync(0xFFFFFFFFu, key);
-            bi = static_cast<int>(__reduce_min_sync(0xFFFFFFFFu, key == top ? static_cast<unsigned>(bi) : 0xFFFFFFFFu));
+            unsigned top = key;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                top = max(top, __shfl_down_sync(0xFFFFFFFFu, top, offset));
+            unsigned best_id = (key == top) ? static_cast<unsigned>(bi) : 0xFFFFFFFFu;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                best_id = min(best_id, __shfl_down_sync(0xFFFFFFFFu, best_id, offset));
+            bi = static_cast<int>(best_id);
         }
         float xb = 0.f;
 #pragma unroll

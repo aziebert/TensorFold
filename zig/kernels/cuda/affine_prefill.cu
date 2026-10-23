@@ -1,6 +1,7 @@
 // Ours: qmm_prefill's prompt GEMM over AffineN's tiles (affine8.cu's layouts) for 2, 3, 5, 6 and 8-bit codes.
 
 #include <cuda_bf16.h>
+#include "tf_bf16_fma.cuh"
 #include <cuda_runtime.h>
 #include <stdint.h>
 
@@ -14,7 +15,7 @@ using namespace qmm_frag;
 // qmm_prefill's 128 by 128 GEMM: weights rounded once to bf16 (s * q + b), one fp32 chain over K, as for 4 bits.
 template <int BITS>
 struct Prefill {
-    static constexpr int GS = 64, BM = 128, BN = 128, WM = 2, WN = 4, STAGES = 3;
+    static constexpr int GS = 64, BM = 128, BN = 128, WM = 2, WN = 4, STAGES = 2;
     static constexpr int THREADS = WM * WN * 32;
     static constexpr int MT = BM / WM / 16;
     static constexpr int NT = BN / WN / 8;
@@ -30,7 +31,7 @@ struct Prefill {
 
 __device__ __forceinline__ uint32_t fma2(uint32_t a, uint32_t b, uint32_t c) {
     uint32_t d;
-    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    d = tf_bf16x2_fma(a, b, c);
     return d;
 }
 
@@ -158,7 +159,7 @@ __device__ __forceinline__ void prefill(const __nv_bfloat16* __restrict__ x, con
 
 // The prompt GEMM a width: shared bytes 50688 + 3072 * BITS.
 #define TF_AFFINE_PREFILL(B)                                                                                                    \
-    static_assert(tf_affine8::Prefill<B>::SMEM == 50688 + 3072 * B, "prefill smem");                                           \
+    static_assert(tf_affine8::Prefill<B>::SMEM == 33792 + 2048 * B, "prefill smem");                                           \
     extern "C" __global__ void __launch_bounds__(256)                                                                           \
         tf_affine##B##_prefill(const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w,                             \
                                const __nv_bfloat16* __restrict__ scales, const __nv_bfloat16* __restrict__ biases,              \

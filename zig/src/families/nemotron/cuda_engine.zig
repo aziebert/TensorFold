@@ -149,6 +149,7 @@ pub const Engine = struct {
         };
         e.k = try kern.Kernels.load(gpa, io, ctx, triton_dir);
         errdefer if (!keep_owner) e.k.deinit();
+        try e.k.loadVolta(ctx); // sm_70 FP4 decode; a no-op on other architectures
         if (e.c.format == .modelopt) {
             if (opts.slide) return error.SlideNeedsMlx; // the learner reads MLX 4-bit projections
             try e.k.loadModelopt(ctx);
@@ -462,7 +463,8 @@ pub const Engine = struct {
     }
 
     pub fn trainOps(e: *const Engine) train_ops.Ops {
-        return .{ .k = &e.k.train, .s = e.stream };
+        if (e.k.train) |tr| return .{ .k = &tr, .s = e.stream };
+        @panic("training kernels not available");
     }
 
     /// Engine.forward: a window of `rows` rows at pos, its first `ids.len` inputs from the host (drafts on the device).

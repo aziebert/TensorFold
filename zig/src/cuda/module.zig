@@ -43,7 +43,7 @@ pub const Module = struct {
             std.log.err("kernel symbol not in module: {s}", .{name});
             return e;
         };
-        return .{ .d = self.d, .handle = f };
+        return .{ .d = self.d, .handle = f, .name = name };
     }
 
     pub const Global = struct { ptr: abi.DevicePtr, len: usize };
@@ -64,6 +64,8 @@ pub const Module = struct {
 pub const Function = struct {
     d: *const Driver,
     handle: abi.Function,
+    /// The symbol the module was asked for (static string literal; "?": loaded by another path).
+    name: ?[]const u8 = null,
 
     pub fn attribute(self: Function, a: abi.FunctionAttribute) Error!c_int {
         var v: c_int = 0;

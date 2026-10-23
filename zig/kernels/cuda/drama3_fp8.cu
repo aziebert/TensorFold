@@ -1,6 +1,7 @@
 // ours: fp8_experts.cu for drama3 with SGLang's per-token-group FP8 activation scales (xsc null: bf16 rows).
 
 #include <cuda_bf16.h>
+#include "tf_bf16_fma.cuh"
 #include <stdint.h>
 
 #include "experts.cuh"
@@ -22,7 +23,7 @@ __device__ __forceinline__ uint4 ld_nc(const uint4* p) {
 __device__ __forceinline__ uint32_t fp8pair(uint32_t v) {
   const uint32_t t = ((v & 0x7Fu) << 4) | ((v & 0x80u) << 8) | ((v & 0x7F00u) << 12) | ((v & 0x8000u) << 16);
   uint32_t r;
-  asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7B807B80u), "r"(0x80008000u));
+  r = tf_bf16x2_fma(t, 0x7B807B80u, 0x80008000u);
   return r;
 }
 

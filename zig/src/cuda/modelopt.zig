@@ -21,6 +21,7 @@ pub const Packer = struct {
     mod: Module,
     fp8_lane: Function,
     bf16_lane: Function,
+    fp8_to_bf16_lane: Function,
     fp4_words: Function,
     fp4_scales: Function,
     fp4_experts: Function,
@@ -33,6 +34,7 @@ pub const Packer = struct {
             .mod = mod,
             .fp8_lane = try mod.function("tf_pack_fp8_lane"),
             .bf16_lane = try mod.function("tf_pack_bf16_lane"),
+            .fp8_to_bf16_lane = try mod.function("tf_dequant_fp8_to_bf16lane"),
             .fp4_words = try mod.function("tf_pack_fp4_words"),
             .fp4_scales = try mod.function("tf_pack_fp4_scales"),
             .fp4_experts = try mod.function("tf_pack_fp4_experts"),
@@ -63,6 +65,12 @@ pub const Packer = struct {
         return flat(p.bf16_lane, s, src, out, n, k, padded(n) * k);
     }
 
+    /// e4m3 codes [n, k] at `src` into `out` (padded(n) * k * 2 bytes): decoded to bf16 in the
+    /// packBf16 permutation, so a ModelOpt FP8 projection runs through the validated bf16 GEMM.
+    pub fn fp8ToBf16Lane(p: *const Packer, s: Stream, src: u64, out: u64, n: usize, k: usize) !void {
+        return flat(p.fp8_to_bf16_lane, s, src, out, n, k, padded(n) * k);
+    }
+
     /// NVFP4 codes [n, k/2] and e4m3 scales [n, k/16] into an `.nvfp4` lane weight's words and scale tiles.
     pub fn fp4Lane(p: *const Packer, s: Stream, codes: u64, scales: u64, words: u64, tiles: u64, n: usize, k: usize) !void {
         try flat(p.fp4_words, s, codes, words, n, k, padded(n) / 64 * (k / 64) * 512);
@@ -89,6 +97,11 @@ pub fn fp8Weight(codes: u64, scale: f32, n: usize, k: usize) qmmf.Weight {
 /// The lane matmul's view of a packed bf16 projection.
 pub fn bf16Weight(w: u64, n: usize, k: usize) qmmf.Weight {
     return .{ .mode = .bf16, .codes = w, .scales = 0, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(padded(n)) };
+}
+
+/// A packed bf16 projection carrying a per-tensor weight scale (ModelOpt FP8 dequantized to bf16).
+pub fn bf16WeightScaled(w: u64, scale: f32, n: usize, k: usize) qmmf.Weight {
+    return .{ .mode = .bf16, .codes = w, .scales = 0, .scale = scale, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(padded(n)) };
 }
 
 test "lane views carry their mode, padded rows and scale" {
