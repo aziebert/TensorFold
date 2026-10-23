@@ -320,6 +320,17 @@ pub const Head = struct {
     /// MTPHead.capture: levels 0 and 1 at every kept-row count, later levels at one row, in the draw mode, per head.
     pub fn capture(h: *Head) !void {
         const rows = state.windowRows(h.e.c);
+        // Pre-grow the head's own scratch (Volta matmul, latent MoE, sampling) with NON-captured
+        // levels at the widest row count, per vocab mode, BEFORE the records below: a cuMemAlloc
+        // inside the capture window fails with STREAM_CAPTURE_UNSUPPORTED, and the window pre-grow
+        // in Engine.capture warms only the window's ops, not the head's. Each level runs exactly
+        // what its graph will replay (the widest one covers every narrower record), so the captures
+        // bake in stable pointers instead of allocating. Garbage data is fine: the graphs read the
+        // meta/logits their caller sets at replay.
+        for ([_]Vocab{ .subset, .full }) |v| {
+            if (v == .full and h.e.w.draft_coverage == null) continue;
+            try h.level(rows, 1, v);
+        }
         for ([_]Vocab{ .subset, .full }) |v| {
             if (v == .full and h.e.w.draft_coverage == null) continue;
             const m = h.graphSet(v);
