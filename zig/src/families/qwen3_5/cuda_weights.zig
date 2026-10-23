@@ -169,9 +169,17 @@ pub fn linear(e: *Engine, into: anytype, ck: *core.Checkpoint, stage: *DeviceBuf
     var parts: [3][]const u8 = undefined;
     const specs = [_]struct { []const u8, core.checkpoint.DType, usize }{ .{ "weight", .u32, k * bits / 32 }, .{ "scales", .bf16, k / 64 }, .{ "biases", .bf16, k / 64 } };
     for (specs, &parts) |p, *part| part.* = (try ck.expect(try std.fmt.bufPrint(&buf, "{s}{s}.{s}", .{ prefix, name, p[0] }), p[1], &.{ n, p[2] })).bytes;
-    const raw = try stageParts(stage, parts);
     const served = servedBits(bits);
-    const out: Proj = if (served == 4) .{ .a4 = try pack4(e, into, raw, n, k) } else blk: {
+    const out: Proj = if (served == 4) blk: {
+        if (e.vqmm != null) {
+            // tf_vqmm884 reads the stored MLX layout directly; the packed tiles are the sm_80+ lanes' format.
+            const l = Affine4.layout(n, k);
+            break :blk .{ .a4 = .{ .w = try upload(into, parts[0]), .s = try upload(into, parts[1]), .b = try upload(into, parts[2]), .n = n, .k = k, .npad = l.npad } };
+        }
+        const raw = try stageParts(stage, parts);
+        break :blk .{ .a4 = try pack4(e, into, raw, n, k) };
+    } else blk: {
+        const raw = try stageParts(stage, parts);
         const l = AffineN.layout(n, k, served);
         const q: AffineN = .{ .w = try into.alloc(l.words), .s = try into.alloc(l.scales), .b = try into.alloc(l.scales), .n = n, .k = k, .npad = l.npad, .bits = served };
         try e.wide.packWords(e.stream, raw[0], bits, n, k, q.w);

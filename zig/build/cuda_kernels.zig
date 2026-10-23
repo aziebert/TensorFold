@@ -35,9 +35,9 @@ pub const kernels = [_]Kernel{
     .{ .name = "route_rows", .flags = glue }, // ours: router logits and softmax top-k rows (cuda/route_rows.zig)
     .{ .name = "flashnext_hc", .flags = glue }, // ours: Flash Next's hyper-connection and n-gram glue
     .{ .name = "flashnext_attn", .flags = glue }, // ours: Flash Next's attention glue and its indexer's pooling and scores
-    .{ .name = "experts3", .flags = &.{"-O3"} }, // ours: 3-bit experts on experts.cu's steps, nibble words from planes
+    .{ .name = "experts3", .flags = &.{"-O3"}, .min_sm = 70 }, // ours: 3-bit experts on experts.cu's steps, nibble words from planes
     .{ .name = "experts3_prefill", .flags = &.{"-O3"} },
-    .{ .name = "moe", .flags = &.{"-O3"} }, // cuda/moe.py: softmax top-k routing with a sigmoid-gated shared expert
+    .{ .name = "moe", .flags = &.{"-O3"}, .min_sm = 70 }, // cuda/moe.py: softmax top-k routing with a sigmoid-gated shared expert
     .{ .name = "qwen36_mtp", .flags = &.{"-O3"} }, // ours: the Qwen3.6 MTP drafter's attention at the target's head width
     .{ .name = "ggml", .flags = &.{ "-O3", "--fmad=false" } },
     .{ .name = "gdn", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
@@ -51,8 +51,8 @@ pub const kernels = [_]Kernel{
     .{ .name = "scan_rows", .flags = &.{ "-O3", "--fmad=false" }, .min_sm = 70 }, // nemotron_h/cuda/mamba.py
     .{ .name = "nemotron_ops", .flags = &.{ "-O3" }, .min_sm = 70 }, // ours: Nemotron's serial feed, routed plan and rests
     .{ .name = "affine4_pack", .flags = &.{"-O3"}, .min_sm = 70 }, // ours: the MLX affine-4 repack into qlinear's tiles
-    .{ .name = "affine8", .flags = &.{"-O3"} }, // ours: MLX affine 2 to 8 bits on lane_gemv tiles of their own width
-    .{ .name = "affine_prefill", .flags = &.{"-O3"} }, // ours: qmm_prefill's prompt GEMM over affine8's tiles
+    .{ .name = "affine8", .flags = &.{"-O3"}, .min_sm = 70 }, // ours: MLX affine 2 to 8 bits on lane_gemv tiles of their own width
+    .{ .name = "affine_prefill", .flags = &.{"-O3"}, .min_sm = 70 }, // ours: qmm_prefill's prompt GEMM over affine8's tiles
     .{ .name = "fp8_experts", .flags = &.{"-O3"} }, // fp8/experts.cu's device code, tensorfold_fp8_experts_v6
     .{ .name = "exlr8", .flags = &.{ "-O3", "--fmad=false" } }, // ours: EXLR8 lane projections, the Metal kernels' order
     .{ .name = "exlr8_dense", .flags = &.{ "-O3", "--fmad=false" } }, // ours: EXLR8 dense matrices by row, the Metal order
@@ -61,9 +61,9 @@ pub const kernels = [_]Kernel{
     .{ .name = "lane_gemv", .flags = &.{ "-O3" }, .min_sm = 70 }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" }, .min_sm = 70 }, // ours: the Metal engine's keyed draws
     .{ .name = "train", .flags = &.{"-O3"} }, // ours: Sliding Weights' learning step (train.metal's kernels)
-    .{ .name = "qwen35", .flags = &.{"-O3"} }, // ours: the Qwen3.5 hybrids' glue, the Metal kernels' rounding points
+    .{ .name = "qwen35", .flags = &.{"-O3"}, .min_sm = 70 }, // ours: the Qwen3.5 hybrids' glue, the Metal kernels' rounding points
     .{ .name = "qwen35_draft", .flags = &.{"-O3"} }, // ours: the DFlash2 drafter's glue (draft_ops.metal's rounding)
-    .{ .name = "qwen35_keep", .flags = &.{"-O3"} }, // ours: a verified window's kept path applied to its stream's state
+    .{ .name = "qwen35_keep", .flags = &.{"-O3"}, .min_sm = 70 }, // ours: a verified window's kept path applied to its stream's state
     .{ .name = "qwen_vision", .flags = &.{ "-O3", "--fmad=false" } }, // ours: the Qwen3.5 vision tower's glue and attention
     .{ .name = "qwen35_kv8", .flags = &.{"-O3"} }, // ours: --kv-cache fp8's e4m3 attention rows for the Qwen3.5 hybrids
     .{ .name = "nemotron_norms", .flags = glue, .min_sm = 70 }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue

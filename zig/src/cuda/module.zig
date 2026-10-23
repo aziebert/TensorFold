@@ -32,8 +32,10 @@ pub const Module = struct {
     }
 
     pub fn unload(self: *Module) void {
+        // A null handle is a deliberately-empty slot (an image this GPU skips); unloading it would fault.
+        if (self.handle == null) return;
         _ = self.d.api.cuModuleUnload(self.handle);
-        self.* = undefined;
+        self.handle = null;
     }
 
     /// A kernel by its exact (mangled or extern "C") symbol; the function lives as long as the module.

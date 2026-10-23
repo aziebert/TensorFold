@@ -85,6 +85,7 @@ pub const Engine = struct {
     draws: cuda.sample.Draws,
     affine: cuda.qlinear.Affine4Kernels,
     wide: cuda.qlinear.AffineNKernels, // the tiles of every width but 4, and their packs
+    vqmm: ?cuda.volta.Qmm = null, // the Volta (sm_70) affine 4-bit lane; null on other architectures
     experts: cuda.experts.Affine4Experts,
     experts3: cuda.experts3.Affine3Experts,
     plan: cuda.grouped.Router,
@@ -133,6 +134,10 @@ pub const Engine = struct {
     pl: u64,
     po: u64,
     logits: u64,
+    // The Volta lane's scratch: fp16 rows and their scales, plus the split-K partials (sk x m x n f32).
+    vx16: u64,
+    vrs: u64,
+    vpart: u64,
     routed: routed.Scratch = .{}, // qwen3_5_moe's routed rows
     amax: u64, // the argmax slices' bests: most_verify rows of argmaxSlices(vocab) (f32, i32)
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
@@ -198,9 +203,16 @@ pub const Engine = struct {
         var loaded: usize = 0;
         errdefer for (e.mods[0..loaded]) |*m| m.unload();
         for (images, 0..) |img, i| {
+            if (img.len == 0) {
+                // No SASS for this GPU (e.g. a Volta build that skipped an sm_80+ kernel); the feature that needs it is resolved to a no-op below and its flag cleared.
+                e.mods[i] = .{ .d = d, .handle = null };
+                continue;
+            }
             e.mods[i] = try cuda.Module.load(d, img);
             loaded += 1;
         }
+        try e.loadVolta(ctx); // the sm_70 affine 4-bit lane; a no-op on other architectures
+        errdefer if (e.vqmm) |*v| v.unload();
         const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
         const gb10 = try ctx.attribute(.compute_capability_major) == 12 and try ctx.attribute(.compute_capability_minor) == 1;
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
@@ -209,12 +221,23 @@ pub const Engine = struct {
         errdefer e.wide.deinit();
         e.draws = try cuda.sample.Draws.resolve(e.mods[5]);
         e.experts = try cuda.experts.Affine4Experts.resolve(e.mods[10], e.mods[11], e.mods[12], sms);
-        e.experts3 = try cuda.experts3.Affine3Experts.resolve(e.mods[14], e.mods[15], sms);
+        if (e.mods[15].handle != null) {
+            e.experts3 = try cuda.experts3.Affine3Experts.resolve(e.mods[14], e.mods[15], sms);
+        } else {
+            // 3-bit experts' prefill has no SASS on this GPU; a dense stream never routes to them.
+            e.experts3 = .{ .pair_fn = .{ .d = d, .handle = null }, .down_fn = .{ .d = d, .handle = null }, .pre_pair_fn = .{ .d = d, .handle = null }, .pre_down_fn = .{ .d = d, .handle = null }, .widen_fn = .{ .d = d, .handle = null }, .planes_fn = .{ .d = d, .handle = null }, .resident = .{ 0, 0 } };
+        }
         e.plan = try cuda.grouped.Router.resolve(e.mods[10]);
         e.moe = try cuda.moe.Fns.resolve(e.mods[13]);
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
-        e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
+        if (kv8 and e.mods[9].handle != null) {
+            e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
+        } else {
+            // fp8 KV caches need sm_80+ SASS; without it, fall back to bf16 caches (the 27B uses these).
+            e.kv8 = false;
+            e.fp8 = .{ .rope = .{ .d = d, .handle = null }, .attn_partial = .{ .d = d, .handle = null }, .compact = .{ .d = d, .handle = null } };
+        }
         e.layers = try gpa.alloc(Layer, g.layers);
         errdefer gpa.free(e.layers);
         var ck = try core.Checkpoint.openModel(gpa, io, dir);
@@ -265,6 +288,10 @@ pub const Engine = struct {
         e.gpa.free(e.dir);
         e.affine.deinit();
         e.wide.deinit();
+        if (e.vqmm) |*v| {
+            v.unload();
+            e.vqmm = null;
+        }
         for (&e.mods) |*m| m.unload();
         e.stream.deinit();
         e.gpa.destroy(e);
@@ -286,6 +313,15 @@ pub const Engine = struct {
         for (taps) |t| if (t >= e.g.layers) return error.BadTap;
         @memcpy(e.taps[0..taps.len], taps);
         e.n_taps = taps.len;
+    }
+
+    /// The Volta (sm_70) affine 4-bit lane: tf_vqmm884's mma.m8n8k4 GEMM and its prep/reduce. Loaded only on
+    /// major 7 — on other architectures the sm_80+ qlinear lanes serve and `e.vqmm` stays null.
+    pub fn loadVolta(e: *Engine, ctx: *const cuda.Context) !void {
+        if (e.vqmm != null) return;
+        const major: u32 = @intCast(try ctx.attribute(.compute_capability_major));
+        if (!cuda.volta.isVolta(major)) return;
+        e.vqmm = try cuda.volta.Qmm.load(e.d);
     }
 
     /// The next `bytes` of the arena, 256-byte aligned.
@@ -327,6 +363,29 @@ pub const Engine = struct {
         e.pl = try t.alloc(R * g.q_heads * max_chunks * 4);
         e.po = try t.alloc(R * g.q_heads * max_chunks * head_dim * 4);
         e.logits = try t.alloc(most_verify * g.vocab * 2);
+        // The Volta affine lane's scratch (sm_70 only, but sized on every build): the fp16 rows,
+        // their row scales, and the biggest split-K partial table any dense shape takes.
+        const vk: usize = @max(g.hidden, g.intermediate); // a projection's inputs at most
+        e.vx16 = try t.alloc(R * vk * 2);
+        e.vrs = try t.alloc(R * 4);
+        var vpart: usize = 0;
+        inline for (.{
+            [_]usize{ g.intermediate, g.hidden }, // gate, up
+            [_]usize{ g.hidden, g.intermediate }, // down
+            [_]usize{ g.convWidth(), g.hidden }, // qkv
+            [_]usize{ g.valueWidth(), g.hidden }, // z
+            [_]usize{ g.v_heads, g.hidden }, // a, b
+            [_]usize{ g.hidden, g.valueWidth() }, // out
+            [_]usize{ 2 * g.attnWidth(), g.hidden }, // q
+            [_]usize{ g.kv_heads * head_dim, g.hidden }, // k, v
+            [_]usize{ g.hidden, g.attnWidth() }, // o
+            [_]usize{ g.vocab, g.hidden }, // head
+            [_]usize{ g.hidden, g.hidden }, // the drafter's and MTP's hidden-to-hidden projs
+        }) |sh| { // every (n, k) the dense family can take, mirroring weights' dims()
+            const p = cuda.volta.Lane.plan(@intCast(sh[0]), @intCast(sh[1]), R);
+            if (p.sk > 1) vpart = @max(vpart, p.sk * R * sh[0] * 4);
+        }
+        e.vpart = try t.alloc(vpart);
         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
         e.amax = try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
         return total;
@@ -356,6 +415,12 @@ pub const Engine = struct {
     fn project(e: *Engine, l: Proj, x: u64, xs: u64, out: u64, rows: usize, prompt: bool, params: u64, sums: bool) !void {
         const n_out = l.outputs();
         const k = l.inputs();
+        if (e.vqmm != null) {
+            switch (l) {
+                .a4 => |q| return e.voltaA4(q, x, out, rows), // sm_70: the tensor-core path replaces the sm_80+ GEMMs
+                else => {}, // a .an has no sm_70 image in this family's checkpoints; the old path stands
+            }
+        }
         if (prompt and rows > 16) return switch (l) {
             .a4 => |q| e.affine.prompt(e.stream, x, q, out, rows),
             .an => |q| e.wide.prompt(e.stream, x, q, out, rows),
@@ -375,6 +440,29 @@ pub const Engine = struct {
                 .a4 => |q| try e.affine.verify(e.stream, xa, sa, q, oa, n),
                 .an => |q| try e.wide.decode(e.stream, xa, sa, q, oa, n),
             }
+        }
+    }
+
+    /// sm_70: out (rows, n) = x (rows, k) through an affine4 weight, via tf_vprep (bf16 rows into exact fp16
+    /// with a power-of-two row scale), tf_vqmm884 (mma.m8n8k4 over the stored words, split-K slices in PART)
+    /// and tf_vreduce (the slice sum). One launch set for any rows, at most max_rows; bf16 out.
+    pub fn voltaA4(e: *Engine, q: cuda.qlinear.Affine4, x: u64, out: u64, rows: usize) !void {
+        const v = e.vqmm orelse return error.VoltaLaneMissing;
+        const m: u32 = @intCast(rows);
+        const n: u32 = @intCast(q.n);
+        const k: u32 = @intCast(q.k);
+        const p = cuda.volta.Lane.plan(n, k, m); // the K slices and row tile, from the shapes alone
+        const gper: u32 = k / 64 / p.sk; // the kernel strides a slice by its group count
+        const fast = k / 8 <= 2560; // tf_vprep keeps five 16-byte pieces per thread (K <= 20480)
+        try e.run(if (fast) v.prep else v.prep_any, .{ m, 1, 1 }, .{ if (fast) 512 else 256, 1, 1 }, .{ x, @as(i64, k), @as(c_int, @intCast(m)), @as(c_int, @intCast(k)), e.vx16, e.vrs });
+        const xi: u3 = switch (p.mt) { 1 => 0, 2 => 1, else => 2 }; // xs in {1,2,4}
+        try e.run(v.matmul[xi][0][0], .{ @as(usize, (n + 127) / 128), p.sk, @as(usize, (m + 8 * p.mt - 1) / (8 * p.mt)) }, .{ 128, 1, 1 }, .{
+            e.vx16, e.vrs, q.w, q.s, q.b, out, if (p.sk > 1) e.vpart else @as(u64, 0),
+            @as(c_int, @intCast(m)), @as(c_int, @intCast(n)), @as(c_int, @intCast(k)), @as(c_int, @intCast(gper)), @as(c_int, @intCast(p.sk)), @as(c_int, 0),
+        });
+        if (p.sk > 1) {
+            const total: i64 = @intCast(m * n);
+            try e.run(v.reduce, .{ @as(usize, (m * n + 255) / 256), 1, 1 }, .{ 256, 1, 1 }, .{ e.vpart, out, total, @as(c_int, @intCast(p.sk)), @as(c_int, 0) });
         }
     }
 
